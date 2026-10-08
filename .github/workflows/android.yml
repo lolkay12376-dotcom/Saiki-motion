@@ -14,12 +14,10 @@ jobs:
           echo "Found zip at: $ZIP"
           mkdir -p work
           unzip -q "$ZIP" -d work
-          ls work
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-      - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.7

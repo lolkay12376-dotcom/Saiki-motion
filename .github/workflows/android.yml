@@ -11,7 +11,6 @@ jobs:
       - name: Unzip project
         run: |
           ZIP=$(find . -name "SaikiMotion.zip" | head -n 1)
-          echo "Found zip at: $ZIP"
           mkdir -p work
           unzip -q "$ZIP" -d work
       - uses: actions/setup-java@v4
@@ -21,9 +20,15 @@ jobs:
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.7
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Build
+        id: build
         working-directory: work/SaikiMotion
+        run: gradle assembleDebug --no-daemon > ../build.log 2>&1 || echo "failed=1" >> $GITHUB_OUTPUT
+      - name: Show errors
+        if: steps.build.outputs.failed == '1'
+        run: |
+          grep -E "^e: " work/build.log | sed 's#.*/com/saiki/motion/##' | head -40
+          exit 1
       - uses: actions/upload-artifact@v4
         with:
           name: SaikiMotion-APK

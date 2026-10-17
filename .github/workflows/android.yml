@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Unzip project
         run: |
-          ZIP=$(find . -name "SaikiMotion2.zip" | head -n 1)
+          ZIP=$(find . -name "SaikiMotion.zip" | head -n 1)
           mkdir -p work
           unzip -q "$ZIP" -d work
       - uses: actions/setup-java@v4

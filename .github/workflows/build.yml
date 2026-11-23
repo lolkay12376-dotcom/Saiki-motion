@@ -151,7 +151,9 @@ jobs:
             [ "$MISSING" = 0 ] || { echo "shaderc libs incomplete"; exit 1; }
           } 2>&1 | tee "$LOGDIR/05-shaderc-install-libs.log"
 
-      # Recompiles GLSL -> SPIR-V so the .spv assets always match shared/shaders/glsl.
+      # Compiles GLSL -> SPIR-V. IMPORTANT: output keeps the .vert/.frag extension (blit.frag.spv, fs.vert.spv ...)
+      # because the native code loads "shaders/<full file name>.spv". Target is Vulkan 1.1 (SPIR-V 1.3) so
+      # Vulkan 1.1 devices (e.g. Mali-G52 tablets) accept the modules; only model_rt (ray query) needs 1.2.
       - name: Compile shaders
         run: |
           ROOT="${{ steps.loc.outputs.root }}"
@@ -159,19 +161,26 @@ jobs:
           SRC="$ROOT/shared/shaders/glsl"
           OUT="$ROOT/app/src/main/assets/shaders"
           {
-            if [ -d "$SRC" ] && ls "$SRC"/*.vert "$SRC"/*.frag > /dev/null 2>&1; then
-              mkdir -p "$OUT"; n=0
-              for f in "$SRC"/*.vert "$SRC"/*.frag; do
-                [ -e "$f" ] || continue
-                b=$(basename "$f"); stage="${b##*.}"
-                echo "glslc $b"
-                "$G" --target-env=vulkan1.2 -fshader-stage="$stage" "$f" -o "$OUT/${b%.*}.spv"
-                n=$((n+1))
-              done
-              echo "compiled $n shaders"
-            else
-              echo "no shared/shaders/glsl here; using the precompiled .spv assets"
-            fi
+            mkdir -p "$OUT"; rm -f "$OUT"/*.spv; n=0
+            for f in "$SRC"/*.vert "$SRC"/*.frag; do
+              [ -e "$f" ] || continue
+              b=$(basename "$f"); stage="${b##*.}"
+              env=vulkan1.1; case "$b" in model_rt.*) env=vulkan1.2;; esac
+              echo "glslc $b ($env)"
+              if ! "$G" --target-env=$env -fshader-stage="$stage" "$f" -o "$OUT/$b.spv"; then
+                echo "WARN: $b failed for $env, retrying with vulkan1.2"
+                "$G" --target-env=vulkan1.2 -fshader-stage="$stage" "$f" -o "$OUT/$b.spv"
+              fi
+              n=$((n+1))
+            done
+            echo "compiled $n shaders"
+            ls "$OUT"
+            python3 - "$OUT" <<'PY'
+          import glob, struct, sys
+          for f in sorted(glob.glob(sys.argv[1] + '/*.spv')):
+              v = struct.unpack('<II', open(f, 'rb').read(8))[1]
+              print(f.split('/')[-1], 'SPIR-V %d.%d' % ((v >> 16) & 255, (v >> 8) & 255))
+          PY
           } 2>&1 | tee "$LOGDIR/06-shaders.log"
 
       - uses: gradle/actions/setup-gradle@v4
@@ -212,7 +221,7 @@ jobs:
             find "$ROOT" -path '*/.cxx/*' -type f \( -name '*.log' -o -name '*.txt' -o -name 'build_command.txt' \) -size -5M -print0 2>/dev/null | head -z -n 300 | xargs -0 -I{} cp --parents {} "$LOGDIR/project-reports/" 2>/dev/null || true
             find "$ROOT" -name 'hs_err_pid*.log' -exec cp {} "$LOGDIR/" \; 2>/dev/null || true
           fi
-          grep -nE '^e: |^w: .*\.kt|error:|FAILURE:|What went wrong|Execution failed|> Task .* FAILED|undefined reference|ld: error|ninja: build stopped|MISSING|No Android project|Caused by:' "$LOGDIR"/*.log > "$LOGDIR/ERRORS.txt" 2>/dev/null || true
+          grep -nE '^e: |^w: .*\.kt|error:|FAILURE:|What went wrong|Execution failed|> Task .* FAILED|undefined reference|ld: error|ninja: build stopped|MISSING|WARN:|No Android project|Caused by:' "$LOGDIR"/*.log > "$LOGDIR/ERRORS.txt" 2>/dev/null || true
           {
             echo "## Build errors (first 120 lines; full logs are in the build-logs artifact)"
             echo '```'

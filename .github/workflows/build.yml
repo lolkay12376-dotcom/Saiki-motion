@@ -1,0 +1,166 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Which APK to build
+        type: choice
+        options: [both, debug, release]
+        default: both
+
+env:
+  NDK_VERSION: 26.1.10909125
+  CMAKE_VERSION: 3.22.1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Finds the Android project anywhere: in the repo, or inside any zip (even zips nested in zips).
+      # A project = a folder with settings.gradle(.kts) that has a module containing src/main/AndroidManifest.xml.
+      # If several are found (e.g. a stale copy) the one with the highest versionCode wins.
+      - name: Locate project (unzips automatically)
+        id: loc
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+          repo = os.environ['GITHUB_WORKSPACE']
+          work = os.path.join(os.environ['RUNNER_TEMP'], 'src')
+          os.makedirs(work, exist_ok=True)
+          SKIP = {'build', '__MACOSX', '.git', 'node_modules', '.gradle'}
+
+          def cands(base):
+              out = []
+              for d, dirs, files in os.walk(base):
+                  dirs[:] = [x for x in dirs if x not in SKIP]
+                  if 'settings.gradle.kts' in files or 'settings.gradle' in files:
+                      for sub in os.listdir(d):
+                          if os.path.isfile(os.path.join(d, sub, 'src', 'main', 'AndroidManifest.xml')):
+                              out.append(d); break
+              return out
+
+          def zips(base):
+              out = []
+              for d, dirs, files in os.walk(base):
+                  dirs[:] = [x for x in dirs if x not in SKIP]
+                  out += [os.path.join(d, f) for f in files if f.lower().endswith('.zip')]
+              return out
+
+          done = set(); found = []
+          for rnd in range(6):
+              found = cands(repo) + cands(work)
+              if found: break
+              new = [z for z in zips(repo) + zips(work) if z not in done]
+              if not new: break
+              for i, z in enumerate(new):
+                  done.add(z)
+                  dest = os.path.join(work, f'z{rnd}_{i}')
+                  os.makedirs(dest, exist_ok=True)
+                  print('unzipping', z)
+                  subprocess.run(['unzip', '-q', '-o', z, '-d', dest])
+          if not found:
+              sys.exit('No Android project found (need settings.gradle[.kts] + a module with src/main/AndroidManifest.xml), even inside zips.')
+
+          def score(d):
+              vc = 0
+              for sub in os.listdir(d):
+                  for n in ('build.gradle.kts', 'build.gradle'):
+                      p = os.path.join(d, sub, n)
+                      if os.path.isfile(p):
+                          m = re.search(r'versionCode\s*=?\s*(\d+)', open(p, errors='ignore').read())
+                          if m: vc = max(vc, int(m.group(1)))
+              return (vc, os.path.isfile(os.path.join(d, 'gradlew')), -d.count(os.sep))
+
+          found.sort(key=score, reverse=True)
+          root = found[0]
+          print('Candidates:', found)
+          print('USING PROJECT:', root)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'root={root}\n')
+          PY
+
+      - name: Install SDK, NDK and CMake
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
+
+      - name: Configure local.properties
+        run: |
+          cd "${{ steps.loc.outputs.root }}"
+          printf 'sdk.dir=%s\ncmake.dir=%s\n' "$ANDROID_HOME" "$ANDROID_HOME/cmake/${CMAKE_VERSION}" > local.properties
+          cat local.properties
+
+      # The NDK ships shaderc as sources only; the app's CMake expects the static libs in the NDK folder.
+      - name: Cache shaderc static libs
+        id: shaderc-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/ndk/26.1.10909125/sources/third_party/shaderc/libs
+          key: shaderc-ndk26.1.10909125-arm64-v8a-v1
+
+      - name: Build shaderc libs (first run only)
+        if: steps.shaderc-cache.outputs.cache-hit != 'true'
+        run: |
+          NDK="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          cd "$NDK/sources/third_party/shaderc"
+          "$NDK/ndk-build" APP_ABI=arm64-v8a APP_STL=c++_shared APP_PLATFORM=android-24 \
+            NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk -j"$(nproc)"
+          ls libs/c++_shared/arm64-v8a
+
+      # Recompiles GLSL -> SPIR-V so the .spv assets always match shared/shaders/glsl.
+      - name: Compile shaders
+        run: |
+          ROOT="${{ steps.loc.outputs.root }}"
+          G="$ANDROID_HOME/ndk/${NDK_VERSION}/shader-tools/linux-x86_64/glslc"
+          SRC="$ROOT/shared/shaders/glsl"
+          OUT="$ROOT/app/src/main/assets/shaders"
+          if [ -d "$SRC" ] && ls "$SRC"/*.vert "$SRC"/*.frag > /dev/null 2>&1; then
+            mkdir -p "$OUT"; n=0
+            for f in "$SRC"/*.vert "$SRC"/*.frag; do
+              [ -e "$f" ] || continue
+              b=$(basename "$f"); stage="${b##*.}"
+              "$G" --target-env=vulkan1.2 -fshader-stage="$stage" "$f" -o "$OUT/${b%.*}.spv"
+              n=$((n+1))
+            done
+            echo "compiled $n shaders"
+          else
+            echo "no shared/shaders/glsl here; using the precompiled .spv assets"
+          fi
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build APK
+        run: |
+          cd "${{ steps.loc.outputs.root }}"
+          case "${{ inputs.variant }}" in
+            debug)   TASKS="assembleDebug" ;;
+            release) TASKS="assembleRelease" ;;
+            *)       TASKS="assembleDebug assembleRelease" ;;
+          esac
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew; G=./gradlew
+          else
+            G=gradle
+          fi
+          $G --no-daemon --stacktrace -Dorg.gradle.jvmargs=-Xmx4g $TASKS
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: SaikiMotion-apk
+          path: ${{ steps.loc.outputs.root }}/**/build/outputs/apk/**/*.apk
+          if-no-files-found: error
